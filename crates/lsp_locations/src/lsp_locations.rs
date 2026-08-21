@@ -5,7 +5,7 @@ use collections::HashMap;
 use editor::actions::{
     FindAllReferences, GoToDeclaration, GoToDefinition, GoToImplementation, GoToTypeDefinition,
 };
-use editor::{Editor, EditorSettings, GotoDefinitionKind, OpenResultsIn};
+use editor::{Editor, EditorSettings, GotoDefinitionKind, Navigated, OpenResultsIn};
 use file_icons::FileIcons;
 use fuzzy::StringMatchCandidate;
 use gpui::{
@@ -38,6 +38,7 @@ fn register(editor: &mut Editor, _window: Option<&mut Window>, cx: &mut Context<
     if !editor.mode().is_full() {
         return;
     }
+    editor.set_definition_locations_handler(show_definition_locations);
     let handle = cx.entity().downgrade();
     editor
         .register_action({
@@ -120,11 +121,53 @@ fn handle_nav_action(
 ) {
     let open_results_in =
         open_results_in.unwrap_or_else(|| EditorSettings::get_global(cx).lsp_results_location);
-    if open_results_in != OpenResultsIn::Picker {
+    if open_results_in != OpenResultsIn::Picker
+        || !LspLocationsPicker::open_for_editor(kind, editor.clone(), window, cx)
+    {
         cx.propagate();
-        return;
     }
-    LspLocationsPicker::open_for_editor(kind, editor.clone(), window, cx);
+}
+
+fn show_definition_locations(
+    editor: &mut Editor,
+    kind: GotoDefinitionKind,
+    locations: &[Location],
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) -> Option<Task<anyhow::Result<Navigated>>> {
+    let workspace = editor.workspace()?.downgrade();
+    if locations
+        .iter()
+        .any(|location| location.buffer.read(cx).file().is_none())
+    {
+        return None;
+    }
+    let matches = build_location_matches(locations, cx);
+    if matches.len() <= 1 {
+        return None;
+    }
+    let kind = match kind {
+        GotoDefinitionKind::Symbol => LspPickerKind::Definition,
+        GotoDefinitionKind::Type => LspPickerKind::TypeDefinition,
+        GotoDefinitionKind::Declaration => LspPickerKind::Declaration,
+        GotoDefinitionKind::Implementation => LspPickerKind::Implementation,
+    };
+    Some(cx.spawn_in(window, async move |editor, cx| {
+        let Some(editor) = editor.upgrade() else {
+            return Ok(Navigated::No);
+        };
+        workspace.update_in(cx, |workspace, window, cx| {
+            let project = workspace.project().clone();
+            workspace.toggle_modal(window, cx, |window, cx| {
+                LspLocationsPicker::new(kind, matches, project, editor.downgrade(), window, cx)
+            });
+            if workspace.active_modal::<LspLocationsPicker>(cx).is_some() {
+                Navigated::Yes
+            } else {
+                Navigated::No
+            }
+        })
+    }))
 }
 
 /// Runs the LSP query for `kind` and returns the raw locations. Returns `None`
@@ -257,16 +300,17 @@ impl LspLocationsPicker {
         editor: WeakEntity<Editor>,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> bool {
         let Some(editor) = editor.upgrade() else {
-            return;
+            return false;
         };
         let Some(workspace) = editor.read(cx).workspace() else {
-            return;
+            return false;
         };
         workspace.update(cx, |workspace, cx| {
             Self::open(kind, editor, workspace, window, cx);
         });
+        true
     }
 
     /// Opens the picker for `kind`: runs a fresh LSP query and shows the
@@ -817,46 +861,18 @@ fn render_matched_line(location_match: &LocationMatch, cx: &App) -> StyledText {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use editor::HighlightKey;
     use editor::test::editor_lsp_test_context::EditorLspTestContext;
-    use gpui::TestAppContext;
+    use gpui::{Modifiers, TestAppContext};
     use indoc::indoc;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
     use workspace::Item as _;
 
-    async fn rust_cx(
-        capabilities: lsp::ServerCapabilities,
-        cx: &mut TestAppContext,
-    ) -> EditorLspTestContext {
-        EditorLspTestContext::new_rust(capabilities, cx).await
-    }
-
-    fn open(cx: &mut EditorLspTestContext, kind: LspPickerKind) {
-        let editor = cx.editor.clone();
-        let workspace = cx.workspace.clone();
-        cx.update(|window, cx| {
-            workspace.update(cx, |workspace, cx| {
-                LspLocationsPicker::open(kind, editor, workspace, window, cx);
-            });
-        });
-        cx.run_until_parked();
-    }
-
-    fn active_picker(cx: &mut EditorLspTestContext) -> Option<Entity<LspLocationsPicker>> {
-        let workspace = cx.workspace.clone();
-        cx.update(|_window, cx| workspace.read(cx).active_modal::<LspLocationsPicker>(cx))
-    }
-
-    fn references(uri: lsp::Uri, ranges: &[(u32, u32, u32)]) -> Vec<lsp::Location> {
-        ranges
-            .iter()
-            .map(|&(row, start, end)| lsp::Location {
-                uri: uri.clone(),
-                range: lsp::Range::new(
-                    lsp::Position::new(row, start),
-                    lsp::Position::new(row, end),
-                ),
-            })
-            .collect()
-    }
+    gpui::actions!(lsp_locations_test, [TestPickerNavigation]);
 
     const SOURCE: &str = indoc! {r#"
         fn main() {
@@ -1025,13 +1041,7 @@ mod tests {
             cx,
         )
         .await;
-        cx.update(|_window, cx| {
-            cx.update_global::<settings::SettingsStore, _>(|settings, cx| {
-                settings.update_user_settings(cx, |settings| {
-                    settings.editor.lsp_results_location = Some(OpenResultsIn::Picker);
-                });
-            });
-        });
+        set_picker(&mut cx);
         cx.set_state(SOURCE);
         cx.lsp
             .set_request_handler::<lsp::request::GotoDefinition, _, _>(async move |_params, _| {
@@ -1139,5 +1149,804 @@ mod tests {
             active_picker(&mut cx).is_some(),
             "declaration should open the picker when lsp_results_location is picker"
         );
+    }
+
+    #[gpui::test]
+    async fn test_cmd_click_multiple_definitions_honors_lsp_results_location(
+        cx: &mut TestAppContext,
+    ) {
+        assert_cached_definition_picker(GotoDefinitionKind::Symbol, cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_cmd_shift_click_type_definitions_honor_lsp_results_location(
+        cx: &mut TestAppContext,
+    ) {
+        assert_cached_definition_picker(GotoDefinitionKind::Type, cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_cmd_click_no_definition_respects_disabled_fallback(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let mut cx = rust_cx(
+            lsp::ServerCapabilities {
+                definition_provider: Some(lsp::OneOf::Left(true)),
+                references_provider: Some(lsp::OneOf::Left(true)),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+        set_picker(&mut cx);
+        cx.update(|_window, cx| {
+            cx.update_global::<settings::SettingsStore, _>(|settings, cx| {
+                settings.update_user_settings(cx, |settings| {
+                    settings.editor.go_to_definition_fallback = Some(GoToDefinitionFallback::None);
+                });
+            });
+        });
+        cx.set_state(SOURCE);
+        cx.lsp
+            .set_request_handler::<lsp::request::GotoDefinition, _, _>(async move |_params, _| {
+                Ok(None)
+            });
+        cx.lsp
+            .set_request_handler::<lsp::request::References, _, _>(async move |_params, _| {
+                panic!(
+                    "cmd-click should not request references when go_to_definition_fallback is none"
+                )
+            });
+
+        let screen_coord = cx
+            .editor(|editor, _, cx| editor.pixel_position_of_cursor(cx))
+            .unwrap();
+        cx.simulate_click(screen_coord, gpui::Modifiers::secondary_key());
+        cx.run_until_parked();
+
+        assert!(
+            active_picker(&mut cx).is_none(),
+            "cmd-click should not open the references picker when go_to_definition_fallback is none"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cmd_click_cached_single_definition_preserves_native_navigation(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        for kind in [GotoDefinitionKind::Symbol, GotoDefinitionKind::Type] {
+            let mut cx = definition_cx(cx).await;
+            let requests =
+                track_definition_requests(&mut cx, kind, &[(2, 14, 17), (1, 8, 11), (2, 14, 17)]);
+            let position = cx.pixel_position(SOURCE);
+            let modifiers = definition_modifiers(kind);
+            cx.simulate_mouse_move(position, None, modifiers);
+            cx.run_until_parked();
+            assert_definition_highlight(&mut cx);
+            assert_eq!(
+                *requests.lock().expect("requests"),
+                [lsp::Position::new(1, 9)]
+            );
+
+            cx.simulate_click(position, modifiers);
+            cx.run_until_parked();
+
+            assert!(active_picker(&mut cx).is_none());
+            cx.assert_editor_state(indoc! {r#"
+                fn main() {
+                    let abc = 123;
+                    let xyz = «abcˇ»;
+                }
+            "#});
+            assert_hover_cleared(&mut cx);
+            assert_eq!(
+                *requests.lock().expect("requests"),
+                [lsp::Position::new(1, 9)]
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_cmd_click_cold_definition_uses_click_position(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        for kind in [GotoDefinitionKind::Symbol, GotoDefinitionKind::Type] {
+            let mut cx = definition_cx(cx).await;
+            let requests =
+                track_definition_requests(&mut cx, kind, &[(2, 14, 17), (1, 8, 11), (0, 3, 7)]);
+            let position = cx.pixel_position(indoc! {r#"
+                fn main() {
+                    let abc = 123;
+                    let xyz = aˇbc;
+                }
+            "#});
+            cx.assert_editor_state(SOURCE);
+            assert_hover_cleared(&mut cx);
+
+            cx.simulate_click(position, definition_modifiers(kind));
+            cx.run_until_parked();
+
+            assert_eq!(
+                *requests.lock().expect("requests"),
+                [lsp::Position::new(2, 15)]
+            );
+            assert_picker_locations(
+                &mut cx,
+                if kind == GotoDefinitionKind::Type {
+                    LspPickerKind::TypeDefinition
+                } else {
+                    LspPickerKind::Definition
+                },
+                &[(0, 3, 7), (1, 8, 11)],
+            );
+            assert_hover_cleared(&mut cx);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_cmd_shift_click_empty_types_respects_references_fallback(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        for fallback in [
+            GoToDefinitionFallback::FindAllReferences,
+            GoToDefinitionFallback::None,
+        ] {
+            let mut cx = definition_cx(cx).await;
+            cx.update(|_, cx| {
+                cx.update_global::<settings::SettingsStore, _>(|settings, cx| {
+                    settings.update_user_settings(cx, |settings| {
+                        settings.editor.go_to_definition_fallback = Some(fallback);
+                    });
+                });
+            });
+            let definitions = track_definition_requests(&mut cx, GotoDefinitionKind::Type, &[]);
+            let references = Arc::new(Mutex::new(Vec::new()));
+            cx.lsp
+                .set_request_handler::<lsp::request::References, _, _>({
+                    let references = references.clone();
+                    let uri = cx.buffer_lsp_url.clone();
+                    move |params, _| {
+                        assert_eq!(params.text_document_position.text_document.uri, uri);
+                        references
+                            .lock()
+                            .expect("requests")
+                            .push(params.text_document_position.position);
+                        let result = self::references(uri.clone(), &[(1, 8, 11), (2, 14, 17)]);
+                        async move { Ok(Some(result)) }
+                    }
+                });
+            let position = cx.pixel_position(SOURCE);
+
+            cx.simulate_click(position, definition_modifiers(GotoDefinitionKind::Type));
+            cx.run_until_parked();
+
+            assert_eq!(
+                *definitions.lock().expect("requests"),
+                [lsp::Position::new(1, 9)]
+            );
+            if fallback == GoToDefinitionFallback::FindAllReferences {
+                assert_eq!(
+                    *references.lock().expect("requests"),
+                    [lsp::Position::new(1, 9)]
+                );
+                assert_picker_locations(
+                    &mut cx,
+                    LspPickerKind::References,
+                    &[(1, 8, 11), (2, 14, 17)],
+                );
+            } else {
+                assert_eq!(
+                    *references.lock().expect("requests"),
+                    Vec::<lsp::Position>::new()
+                );
+                assert!(active_picker(&mut cx).is_none());
+            }
+            cx.assert_editor_state(SOURCE);
+            assert_hover_cleared(&mut cx);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_cmd_shift_click_during_type_hover_ignores_cached_symbol(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let mut cx = definition_cx(cx).await;
+        let symbols = track_definition_requests(&mut cx, GotoDefinitionKind::Symbol, &[(0, 3, 7)]);
+        let types = Arc::new(Mutex::new(Vec::new()));
+        cx.lsp
+            .set_request_handler::<lsp::request::GotoTypeDefinition, _, _>({
+                let types = types.clone();
+                let uri = cx.buffer_lsp_url.clone();
+                move |params, cx| {
+                    assert_eq!(params.text_document_position_params.text_document.uri, uri);
+                    let request_count = {
+                        let mut types = types.lock().expect("requests");
+                        types.push(params.text_document_position_params.position);
+                        types.len()
+                    };
+                    let result = definitions(uri.clone(), &[(2, 8, 11), (2, 14, 17)]);
+                    async move {
+                        if request_count == 1 {
+                            cx.background_executor().timer(Duration::from_secs(1)).await;
+                        }
+                        Ok(Some(result))
+                    }
+                }
+            });
+        let position = cx.pixel_position(SOURCE);
+        cx.simulate_mouse_move(position, None, Modifiers::secondary_key());
+        cx.run_until_parked();
+        assert_definition_highlight(&mut cx);
+        assert_eq!(
+            *symbols.lock().expect("requests"),
+            [lsp::Position::new(1, 9)]
+        );
+        let modifiers = definition_modifiers(GotoDefinitionKind::Type);
+        cx.simulate_modifiers_change(modifiers);
+        cx.run_until_parked();
+        assert_eq!(*types.lock().expect("requests"), [lsp::Position::new(1, 9)]);
+        assert!(active_picker(&mut cx).is_none());
+
+        cx.simulate_click(position, modifiers);
+        cx.run_until_parked();
+
+        assert_picker_locations(
+            &mut cx,
+            LspPickerKind::TypeDefinition,
+            &[(2, 8, 11), (2, 14, 17)],
+        );
+        assert_hover_cleared(&mut cx);
+        assert_eq!(
+            *symbols.lock().expect("requests"),
+            [lsp::Position::new(1, 9)]
+        );
+        assert_eq!(
+            *types.lock().expect("requests"),
+            [lsp::Position::new(1, 9), lsp::Position::new(1, 9)],
+        );
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_picker_locations(
+            &mut cx,
+            LspPickerKind::TypeDefinition,
+            &[(2, 8, 11), (2, 14, 17)],
+        );
+        assert_hover_cleared(&mut cx);
+    }
+
+    #[gpui::test]
+    async fn test_cmd_click_during_new_symbol_hover_ignores_cached_symbol(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let mut cx = definition_cx(cx).await;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        cx.lsp
+            .set_request_handler::<lsp::request::GotoDefinition, _, _>({
+                let requests = requests.clone();
+                let uri = cx.buffer_lsp_url.clone();
+                move |params, cx| {
+                    assert_eq!(params.text_document_position_params.text_document.uri, uri);
+                    let position = params.text_document_position_params.position;
+                    let request_count = {
+                        let mut requests = requests.lock().expect("requests");
+                        requests.push(position);
+                        requests.len()
+                    };
+                    let result = match (position.line, position.character) {
+                        (1, 9) => definitions(uri.clone(), &[(0, 3, 7)]),
+                        (2, 9) => definitions(uri.clone(), &[(1, 8, 11), (2, 14, 17)]),
+                        _ => panic!("unexpected definition position: {position:?}"),
+                    };
+                    async move {
+                        if request_count == 2 {
+                            cx.background_executor().timer(Duration::from_secs(1)).await;
+                        }
+                        Ok(Some(result))
+                    }
+                }
+            });
+        let first_position = cx.pixel_position(SOURCE);
+        let second_position = cx.pixel_position(indoc! {r#"
+            fn main() {
+                let abc = 123;
+                let xˇyz = abc;
+            }
+        "#});
+        let modifiers = Modifiers::secondary_key();
+        cx.simulate_mouse_move(first_position, None, modifiers);
+        cx.run_until_parked();
+        assert_definition_highlight(&mut cx);
+        assert_eq!(
+            *requests.lock().expect("requests"),
+            [lsp::Position::new(1, 9)]
+        );
+
+        cx.simulate_mouse_move(second_position, None, modifiers);
+        cx.run_until_parked();
+        assert_eq!(
+            *requests.lock().expect("requests"),
+            [lsp::Position::new(1, 9), lsp::Position::new(2, 9)],
+        );
+        cx.assert_editor_state(SOURCE);
+        assert!(active_picker(&mut cx).is_none());
+
+        cx.simulate_click(second_position, modifiers);
+        cx.run_until_parked();
+
+        assert_eq!(
+            *requests.lock().expect("requests"),
+            [
+                lsp::Position::new(1, 9),
+                lsp::Position::new(2, 9),
+                lsp::Position::new(2, 9)
+            ],
+        );
+        assert_picker_locations(
+            &mut cx,
+            LspPickerKind::Definition,
+            &[(1, 8, 11), (2, 14, 17)],
+        );
+        assert_hover_cleared(&mut cx);
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            *requests.lock().expect("requests"),
+            [
+                lsp::Position::new(1, 9),
+                lsp::Position::new(2, 9),
+                lsp::Position::new(2, 9)
+            ],
+        );
+        assert_picker_locations(
+            &mut cx,
+            LspPickerKind::Definition,
+            &[(1, 8, 11), (2, 14, 17)],
+        );
+        assert_hover_cleared(&mut cx);
+    }
+
+    #[gpui::test]
+    async fn test_cmd_click_default_and_split_preserve_native_navigation(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        for (open_results_in, split) in [
+            (OpenResultsIn::MultiBuffer, false),
+            (OpenResultsIn::Picker, true),
+        ] {
+            for kind in [GotoDefinitionKind::Symbol, GotoDefinitionKind::Type] {
+                let mut cx = definition_cx(cx).await;
+                cx.update(|_, cx| {
+                    cx.update_global::<settings::SettingsStore, _>(|settings, cx| {
+                        settings.update_user_settings(cx, |settings| {
+                            settings.editor.lsp_results_location = Some(open_results_in);
+                        });
+                    });
+                });
+                let requests = track_definition_requests(&mut cx, kind, &[(0, 3, 7), (2, 14, 17)]);
+                let position = cx.pixel_position(SOURCE);
+                let modifiers = Modifiers {
+                    alt: split,
+                    ..definition_modifiers(kind)
+                };
+                cx.simulate_mouse_move(position, None, modifiers);
+                cx.run_until_parked();
+                assert_definition_highlight(&mut cx);
+
+                cx.simulate_click(position, modifiers);
+                cx.run_until_parked();
+
+                assert!(active_picker(&mut cx).is_none());
+                assert_hover_cleared(&mut cx);
+                assert_eq!(
+                    *requests.lock().expect("requests"),
+                    [lsp::Position::new(1, 9)]
+                );
+                let workspace = cx.workspace.clone();
+                let source_editor = cx.editor.clone();
+                cx.update(|_, cx| {
+                    let workspace = workspace.read(cx);
+                    assert_eq!(workspace.panes().len(), if split { 2 } else { 1 });
+                    let editor = workspace
+                        .active_item_as::<Editor>(cx)
+                        .expect("active editor");
+                    if split {
+                        assert_ne!(editor, source_editor);
+                    } else {
+                        assert_eq!(editor, source_editor);
+                    }
+                    editor.update(cx, |editor, cx| {
+                        assert_eq!(
+                            editor
+                                .selections
+                                .all::<Point>(&editor.display_snapshot(cx))
+                                .into_iter()
+                                .map(|selection| selection.range())
+                                .collect::<Vec<_>>(),
+                            [
+                                Point::new(0, 3)..Point::new(0, 7),
+                                Point::new(2, 14)..Point::new(2, 17)
+                            ],
+                        );
+                    });
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_definition_locations_handler_declines_empty_single_and_fileless(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let mut cx = definition_cx(cx).await;
+        let locations = cx.update_editor(|editor, _, cx| {
+            let buffer = editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .expect("singleton buffer");
+            let snapshot = buffer.read(cx).snapshot();
+            [3..7, 45..48]
+                .into_iter()
+                .map(|range| Location {
+                    buffer: buffer.clone(),
+                    range: snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end),
+                })
+                .collect::<Vec<_>>()
+        });
+        let fileless = cx.update(|_, cx| {
+            let buffer = cx.new(|cx| Buffer::local("abc", cx));
+            let snapshot = buffer.read(cx).snapshot();
+            Location {
+                range: snapshot.anchor_before(0)..snapshot.anchor_after(3),
+                buffer,
+            }
+        });
+        for locations in [
+            Vec::new(),
+            vec![locations[0].clone()],
+            vec![locations[0].clone(), locations[0].clone()],
+            vec![fileless.clone()],
+            vec![locations[0].clone(), fileless, locations[1].clone()],
+        ] {
+            let task = cx.update_editor(|editor, window, cx| {
+                show_definition_locations(
+                    editor,
+                    GotoDefinitionKind::Symbol,
+                    &locations,
+                    window,
+                    cx,
+                )
+            });
+            assert!(task.is_none());
+        }
+        cx.run_until_parked();
+        assert!(active_picker(&mut cx).is_none());
+        cx.assert_editor_state(SOURCE);
+    }
+
+    #[gpui::test]
+    async fn test_picker_navigation_without_workspace_propagates(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let mut cx = definition_cx(cx).await;
+        let standalone = cx.update(|window, cx| {
+            let buffer = cx.new(|cx| Buffer::local("abc", cx));
+            cx.new(|cx| Editor::for_buffer(buffer, None, window, cx))
+        });
+        cx.update(|window, cx| {
+            standalone.update(cx, |editor, cx| {
+                assert!(editor.workspace().is_none());
+                let buffer = editor
+                    .buffer()
+                    .read(cx)
+                    .as_singleton()
+                    .expect("singleton buffer");
+                let snapshot = buffer.read(cx).snapshot();
+                let locations = [0..1, 2..3].map(|range| Location {
+                    buffer: buffer.clone(),
+                    range: snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end),
+                });
+                assert!(
+                    show_definition_locations(
+                        editor,
+                        GotoDefinitionKind::Symbol,
+                        &locations,
+                        window,
+                        cx
+                    )
+                    .is_none()
+                );
+            })
+        });
+        let propagated = Arc::new(AtomicUsize::new(0));
+        cx.update_editor(|editor, _, cx| {
+            let standalone = standalone.downgrade();
+            editor
+                .register_action(move |_: &TestPickerNavigation, window, cx| {
+                    handle_nav_action(
+                        Some(OpenResultsIn::Picker),
+                        LspPickerKind::Definition,
+                        &standalone,
+                        window,
+                        cx,
+                    );
+                })
+                .detach();
+            App::on_action::<TestPickerNavigation>(cx, {
+                let propagated = propagated.clone();
+                move |_, _| {
+                    propagated.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        });
+
+        cx.dispatch_action(TestPickerNavigation);
+
+        assert_eq!(propagated.load(Ordering::SeqCst), 1);
+        assert!(active_picker(&mut cx).is_none());
+    }
+
+    #[gpui::test]
+    async fn test_definition_locations_handler_does_not_present_after_editor_dropped(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let mut cx = definition_cx(cx).await;
+        let workspace = cx.workspace.clone();
+        let buffer = cx.editor(|editor, _, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .expect("singleton buffer")
+        });
+        let source_editor = cx.update(|window, cx| {
+            let source_editor = cx.new(|cx| Editor::for_buffer(buffer, None, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                source_editor.update(cx, |editor, cx| {
+                    editor.added_to_workspace(workspace, window, cx);
+                });
+            });
+            source_editor
+        });
+        cx.run_until_parked();
+        let weak_editor = source_editor.downgrade();
+        let task = cx.update(|window, cx| {
+            let task = source_editor.update(cx, |editor, cx| {
+                let buffer = editor
+                    .buffer()
+                    .read(cx)
+                    .as_singleton()
+                    .expect("singleton buffer");
+                let snapshot = buffer.read(cx).snapshot();
+                let locations = [3..7, 45..48].map(|range| Location {
+                    buffer: buffer.clone(),
+                    range: snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end),
+                });
+                show_definition_locations(
+                    editor,
+                    GotoDefinitionKind::Symbol,
+                    &locations,
+                    window,
+                    cx,
+                )
+                .expect("presenter task")
+            });
+            drop(source_editor);
+            assert!(weak_editor.upgrade().is_none());
+            assert!(
+                workspace
+                    .read(cx)
+                    .active_modal::<LspLocationsPicker>(cx)
+                    .is_none()
+            );
+            task
+        });
+
+        assert_eq!(task.await.expect("presenter result"), Navigated::No);
+
+        cx.run_until_parked();
+        assert!(weak_editor.upgrade().is_none());
+        assert!(active_picker(&mut cx).is_none());
+        cx.assert_editor_state(SOURCE);
+    }
+
+    async fn rust_cx(
+        capabilities: lsp::ServerCapabilities,
+        cx: &mut TestAppContext,
+    ) -> EditorLspTestContext {
+        EditorLspTestContext::new_rust(capabilities, cx).await
+    }
+
+    fn open(cx: &mut EditorLspTestContext, kind: LspPickerKind) {
+        let editor = cx.editor.clone();
+        let workspace = cx.workspace.clone();
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                LspLocationsPicker::open(kind, editor, workspace, window, cx);
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    fn active_picker(cx: &mut EditorLspTestContext) -> Option<Entity<LspLocationsPicker>> {
+        let workspace = cx.workspace.clone();
+        cx.update(|_window, cx| workspace.read(cx).active_modal::<LspLocationsPicker>(cx))
+    }
+
+    fn set_picker(cx: &mut EditorLspTestContext) {
+        cx.update(|_window, cx| {
+            cx.update_global::<settings::SettingsStore, _>(|settings, cx| {
+                settings.update_user_settings(cx, |settings| {
+                    settings.editor.lsp_results_location = Some(OpenResultsIn::Picker);
+                });
+            });
+        });
+    }
+
+    fn definitions(uri: lsp::Uri, ranges: &[(u32, u32, u32)]) -> lsp::GotoDefinitionResponse {
+        lsp::GotoDefinitionResponse::Array(references(uri, ranges))
+    }
+
+    fn references(uri: lsp::Uri, ranges: &[(u32, u32, u32)]) -> Vec<lsp::Location> {
+        ranges
+            .iter()
+            .map(|&(row, start, end)| lsp::Location {
+                uri: uri.clone(),
+                range: lsp::Range::new(
+                    lsp::Position::new(row, start),
+                    lsp::Position::new(row, end),
+                ),
+            })
+            .collect()
+    }
+
+    async fn definition_cx(cx: &mut TestAppContext) -> EditorLspTestContext {
+        let mut cx = rust_cx(
+            lsp::ServerCapabilities {
+                definition_provider: Some(lsp::OneOf::Left(true)),
+                type_definition_provider: Some(lsp::TypeDefinitionProviderCapability::Simple(true)),
+                references_provider: Some(lsp::OneOf::Left(true)),
+                ..lsp::ServerCapabilities::default()
+            },
+            cx,
+        )
+        .await;
+        set_picker(&mut cx);
+        cx.set_state(SOURCE);
+        cx
+    }
+
+    fn definition_modifiers(kind: GotoDefinitionKind) -> Modifiers {
+        Modifiers {
+            shift: kind == GotoDefinitionKind::Type,
+            ..Modifiers::secondary_key()
+        }
+    }
+
+    fn track_definition_requests(
+        cx: &mut EditorLspTestContext,
+        kind: GotoDefinitionKind,
+        ranges: &[(u32, u32, u32)],
+    ) -> Arc<Mutex<Vec<lsp::Position>>> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let handler = {
+            let requests = requests.clone();
+            let uri = cx.buffer_lsp_url.clone();
+            let result = definitions(uri.clone(), ranges);
+            move |params: lsp::GotoDefinitionParams, _| {
+                assert_eq!(params.text_document_position_params.text_document.uri, uri);
+                requests
+                    .lock()
+                    .expect("requests")
+                    .push(params.text_document_position_params.position);
+                let result = result.clone();
+                async move { Ok(Some(result)) }
+            }
+        };
+        match kind {
+            GotoDefinitionKind::Symbol => {
+                cx.lsp
+                    .set_request_handler::<lsp::request::GotoDefinition, _, _>(handler);
+            }
+            GotoDefinitionKind::Type => {
+                cx.lsp
+                    .set_request_handler::<lsp::request::GotoTypeDefinition, _, _>(handler);
+            }
+            _ => panic!("unexpected definition kind: {kind:?}"),
+        }
+        requests
+    }
+
+    async fn assert_cached_definition_picker(kind: GotoDefinitionKind, cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let mut cx = definition_cx(cx).await;
+        let requests = track_definition_requests(
+            &mut cx,
+            kind,
+            &[(2, 14, 17), (1, 8, 11), (0, 3, 7), (2, 14, 17)],
+        );
+        let position = cx.pixel_position(SOURCE);
+        let modifiers = definition_modifiers(kind);
+        cx.simulate_mouse_move(position, None, modifiers);
+        cx.run_until_parked();
+        assert_definition_highlight(&mut cx);
+        assert_eq!(
+            *requests.lock().expect("requests"),
+            [lsp::Position::new(1, 9)]
+        );
+        assert!(active_picker(&mut cx).is_none());
+
+        cx.simulate_click(position, modifiers);
+        cx.run_until_parked();
+
+        assert_eq!(
+            *requests.lock().expect("requests"),
+            [lsp::Position::new(1, 9)]
+        );
+        assert_picker_locations(
+            &mut cx,
+            if kind == GotoDefinitionKind::Type {
+                LspPickerKind::TypeDefinition
+            } else {
+                LspPickerKind::Definition
+            },
+            &[(0, 3, 7), (2, 14, 17)],
+        );
+        assert_hover_cleared(&mut cx);
+    }
+
+    fn assert_definition_highlight(cx: &mut EditorLspTestContext) {
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            indoc! {r#"
+            fn main() {
+                let «abc» = 123;
+                let xyz = abc;
+            }
+        "#},
+        );
+    }
+
+    fn assert_hover_cleared(cx: &mut EditorLspTestContext) {
+        cx.editor(|editor, _, cx| {
+            assert_eq!(
+                editor
+                    .text_highlights(HighlightKey::HoveredLinkState, cx)
+                    .map(|(_, ranges)| ranges.len()),
+                None
+            );
+        });
+    }
+
+    fn assert_picker_locations(
+        cx: &mut EditorLspTestContext,
+        kind: LspPickerKind,
+        ranges: &[(u32, u32, u32)],
+    ) {
+        let modal = active_picker(cx).expect("locations picker");
+        cx.update(|_, cx| {
+            let delegate = &modal.read(cx).picker.read(cx).delegate;
+            assert_eq!(delegate.kind, kind);
+            let actual = delegate
+                .all_matches
+                .iter()
+                .map(|location| {
+                    let snapshot = location.buffer.read(cx).snapshot();
+                    let start = snapshot.summary_for_anchor::<Point>(&location.anchor_range.start);
+                    let end = snapshot.summary_for_anchor::<Point>(&location.anchor_range.end);
+                    assert_eq!(snapshot.offset_to_point(location.range.start), start);
+                    assert_eq!(snapshot.offset_to_point(location.range.end), end);
+                    (location.path.path.as_unix_str().to_string(), start..end)
+                })
+                .collect::<Vec<_>>();
+            let expected = ranges
+                .iter()
+                .map(|&(row, start, end)| {
+                    (
+                        "dir/file.rs".to_string(),
+                        Point::new(row, start)..Point::new(row, end),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        });
     }
 }

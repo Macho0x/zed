@@ -1,7 +1,8 @@
 use crate::{
     Anchor, Editor, EditorSettings, EditorSnapshot, FindAllReferences, GoToDefinitionSplit,
     GoToTypeDefinition, GoToTypeDefinitionSplit, GotoDefinitionKind, HighlightKey, Navigated,
-    PointForPosition, SelectPhase, editor_settings::GoToDefinitionFallback, scroll::ScrollAmount,
+    OpenResultsIn, PointForPosition, SelectPhase, editor_settings::GoToDefinitionFallback,
+    scroll::ScrollAmount,
 };
 use gpui::{
     App, AsyncWindowContext, Context, Entity, Focusable, HighlightStyle, Modifiers, Pixels, Task,
@@ -10,7 +11,7 @@ use gpui::{
 use language::{Bias, ToOffset};
 use linkify::{LinkFinder, LinkKind};
 use lsp::LanguageServerId;
-use project::{InlayId, LocationLink, Project, ResolvedPath};
+use project::{InlayId, Location, LocationLink, Project, ResolvedPath};
 use regex::Regex;
 use settings::Settings;
 use std::{ops::Range, str::FromStr as _, sync::LazyLock};
@@ -19,6 +20,15 @@ use theme::ActiveTheme as _;
 use util::{
     ResultExt, TryFutureExt as _, markdown::source_position_from_fragment, paths::PathWithPosition,
 };
+use workspace::NavigationEntry;
+
+pub type DefinitionLocationsHandler = fn(
+    &mut Editor,
+    GotoDefinitionKind,
+    &[Location],
+    &mut Window,
+    &mut Context<Editor>,
+) -> Option<Task<anyhow::Result<Navigated>>>;
 
 #[derive(Debug)]
 pub struct HoveredLinkState {
@@ -150,6 +160,10 @@ pub fn exclude_link_to_position(
 }
 
 impl Editor {
+    pub fn set_definition_locations_handler(&mut self, handler: DefinitionLocationsHandler) {
+        self.definition_locations_handler = Some(handler);
+    }
+
     pub(crate) fn update_hovered_link(
         &mut self,
         point_for_position: PointForPosition,
@@ -207,6 +221,7 @@ impl Editor {
         cx: &mut Context<Editor>,
     ) {
         let focus_handle = self.focus_handle(cx);
+
         let reveal_task = self.cmd_click_reveal_task(point, modifiers, window, cx);
         cx.spawn_in(window, async move |_, cx| {
             let definition_revealed = reveal_task.await.log_err().unwrap_or(Navigated::No);
@@ -257,9 +272,36 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> Task<anyhow::Result<Navigated>> {
+        let kind = if modifiers.shift {
+            GotoDefinitionKind::Type
+        } else {
+            GotoDefinitionKind::Symbol
+        };
         if let Some(hovered_link_state) = self.hovered_link_state.take() {
             self.hide_hovered_link(cx);
-            if !hovered_link_state.links.is_empty() {
+            let cached_links_match = if hovered_link_state
+                .links
+                .iter()
+                .all(|link| matches!(link, HoverLink::Text(_)))
+            {
+                let snapshot = self.snapshot(window, cx);
+                hovered_link_state.preferred_kind == kind
+                    && point.as_valid().is_some_and(|point| {
+                        let trigger_point =
+                            TriggerPoint::Text(snapshot.buffer_snapshot().anchor_before(
+                                point.to_offset(&snapshot.display_snapshot, Bias::Left),
+                            ));
+                        hovered_link_state
+                            .symbol_range
+                            .as_ref()
+                            .is_some_and(|range| {
+                                range.point_within_range(&trigger_point, &snapshot)
+                            })
+                    })
+            } else {
+                true
+            };
+            if !hovered_link_state.links.is_empty() && cached_links_match {
                 if !self.focus_handle.is_focused(window) {
                     window.focus(&self.focus_handle, cx);
                 }
@@ -297,7 +339,7 @@ impl Editor {
                 let nav_entry = self.navigation_entry(multi_buffer_anchor, cx);
                 let split = Self::is_alt_pressed(&modifiers, cx);
                 let navigate_task =
-                    self.navigate_to_hover_links(None, links, nav_entry, split, window, cx);
+                    self.navigate_to_clicked_links(kind, links, nav_entry, split, window, cx);
                 self.select(SelectPhase::End, window, cx);
                 return navigate_task;
             }
@@ -317,6 +359,37 @@ impl Editor {
 
         let navigate_task = if point.as_valid().is_some() {
             let split = Self::is_alt_pressed(&modifiers, cx);
+            if !split
+                && EditorSettings::get_global(cx).lsp_results_location == OpenResultsIn::Picker
+                && self.definition_locations_handler.is_some()
+                && self.workspace().is_some()
+            {
+                let definitions = self.definition_locations_of_kind(kind, cx);
+                let origin = self.navigation_entry(self.selections.newest_anchor().head(), cx);
+                self.select(SelectPhase::End, window, cx);
+                return match definitions {
+                    Some(definitions) => cx.spawn_in(window, async move |editor, cx| {
+                        let links = definitions
+                            .await?
+                            .into_iter()
+                            .map(|target| {
+                                HoverLink::Text(LocationLink {
+                                    origin: None,
+                                    target,
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        editor
+                            .update_in(cx, |editor, window, cx| {
+                                editor.navigate_to_clicked_links(
+                                    kind, links, origin, false, window, cx,
+                                )
+                            })?
+                            .await
+                    }),
+                    None => Task::ready(Ok(Navigated::No)),
+                };
+            }
             match (modifiers.shift, split) {
                 (true, true) => {
                     self.go_to_type_definition_split(&GoToTypeDefinitionSplit, window, cx)
@@ -334,6 +407,34 @@ impl Editor {
         };
         self.select(SelectPhase::End, window, cx);
         navigate_task
+    }
+
+    fn navigate_to_clicked_links(
+        &mut self,
+        kind: GotoDefinitionKind,
+        links: Vec<HoverLink>,
+        origin: Option<NavigationEntry>,
+        split: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<Navigated>> {
+        if !split
+            && EditorSettings::get_global(cx).lsp_results_location == OpenResultsIn::Picker
+            && links.iter().all(|link| matches!(link, HoverLink::Text(_)))
+            && let Some(handler) = self.definition_locations_handler
+        {
+            let locations = links
+                .iter()
+                .filter_map(|link| match link {
+                    HoverLink::Text(link) => Some(link.target.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if let Some(task) = handler(self, kind, &locations, window, cx) {
+                return task;
+            }
+        }
+        self.navigate_to_hover_links(Some(kind), links, origin, split, window, cx)
     }
 }
 
