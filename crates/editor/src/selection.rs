@@ -1973,9 +1973,9 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
-        let all_selections = self.selections.all::<Point>(&display_map);
         let text_layout_details = self.text_layout_details(window, cx);
         let buffer = display_map.buffer_snapshot();
+        let all_selections = self.selections.all_unexpanded::<Point>(&display_map);
         let goal_source_for_selection = |selection: &Selection<Point>| {
             let end_bias = if selection.is_empty() {
                 Bias::Right
@@ -1996,24 +1996,6 @@ impl Editor {
         {
             self.add_selections_state = None;
         }
-        let mut columnar_rows = ColumnarSelectionRows::new(&display_map);
-        let (mut columnar_selections, new_selections_to_columnarize) = {
-            if let Some(state) = self.add_selections_state.as_ref() {
-                let columnar_selection_ids: HashSet<_> = state
-                    .groups
-                    .iter()
-                    .flat_map(|group| group.stack.iter())
-                    .copied()
-                    .collect();
-
-                all_selections
-                    .into_iter()
-                    .partition(|s| columnar_selection_ids.contains(&s.id))
-            } else {
-                (Vec::new(), all_selections)
-            }
-        };
-
         let mut state = self
             .add_selections_state
             .take()
@@ -2021,6 +2003,25 @@ impl Editor {
                 groups: Vec::new(),
                 skip_soft_wrap,
             });
+        let live_selection_ids = all_selections
+            .iter()
+            .map(|selection| selection.id)
+            .collect::<HashSet<_>>();
+        state.groups.retain_mut(|group| {
+            group.stack.retain(|id| live_selection_ids.contains(id));
+            !group.stack.is_empty() && (skip_soft_wrap || group.stack.len() > 1)
+        });
+        let columnar_selection_ids = state
+            .groups
+            .iter()
+            .flat_map(|group| group.stack.iter())
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut columnar_rows = ColumnarSelectionRows::new(&display_map);
+        let (mut columnar_selections, new_selections_to_columnarize) =
+            all_selections
+                .into_iter()
+                .partition::<Vec<_>, _>(|selection| columnar_selection_ids.contains(&selection.id));
 
         for selection in new_selections_to_columnarize {
             if skip_soft_wrap {
@@ -2030,7 +2031,9 @@ impl Editor {
                 let columns = columnar_rows.columns_for_range(selection.range());
                 let goal_source = Some(goal_source_for_selection(&selection));
                 let mut stack = Vec::new();
-                if start.row() == end.row() {
+                let hidden =
+                    display_map.is_block_line(selection.start.to_display_point(&display_map).row());
+                if start.row() == end.row() && !hidden {
                     stack.push(selection.id);
                     columnar_selections.push(selection);
                 } else {
@@ -2068,16 +2071,28 @@ impl Editor {
             let end_x = display_map.x_for_display_point(range.end, &text_layout_details);
             let positions = start_x.min(end_x)..start_x.max(end_x);
             let mut stack = Vec::new();
-            for row in range.start.row().0..=range.end.row().0 {
-                if let Some(selection) = self.selections.build_columnar_selection(
-                    &display_map,
-                    DisplayRow(row),
-                    &positions,
-                    selection.reversed,
-                    &text_layout_details,
-                ) {
-                    stack.push(selection.id);
-                    columnar_selections.push(selection);
+            if range.start.row() == range.end.row() && !display_map.is_block_line(range.start.row())
+            {
+                stack.push(selection.id);
+                columnar_selections.push(Selection {
+                    goal: SelectionGoal::HorizontalRange {
+                        start: positions.start.into(),
+                        end: positions.end.into(),
+                    },
+                    ..selection
+                });
+            } else {
+                for row in range.start.row().0..=range.end.row().0 {
+                    if let Some(selection) = self.selections.build_columnar_selection(
+                        &display_map,
+                        DisplayRow(row),
+                        &positions,
+                        selection.reversed,
+                        &text_layout_details,
+                    ) {
+                        stack.push(selection.id);
+                        columnar_selections.push(selection);
+                    }
                 }
             }
             if !stack.is_empty() {
@@ -2089,6 +2104,8 @@ impl Editor {
                     stack,
                     goal_source: None,
                 });
+            } else {
+                columnar_selections.push(selection);
             }
         }
 
@@ -2109,7 +2126,6 @@ impl Editor {
                 .collect::<HashMap<_, _>>();
             let mut map = HashMap::default();
             for group in &mut state.groups {
-                group.stack.retain(|id| selections_by_id.contains_key(id));
                 let Some(oldest_selection) =
                     group.stack.first().and_then(|id| selections_by_id.get(id))
                 else {
@@ -2146,10 +2162,6 @@ impl Editor {
                     group.above = above;
                 }
                 if above == group.above {
-                    let range = selection.display_range(&display_map).sorted();
-                    debug_assert!(skip_soft_wrap || range.start.row() == range.end.row());
-                    let row = range.start.row();
-
                     let maybe_new_selection = if skip_soft_wrap {
                         let goal_columns = goal_columns_by_selection_id
                             .remove(&selection.id)
@@ -2162,6 +2174,12 @@ impl Editor {
                             &goal_columns,
                         )
                     } else {
+                        let range = selection.display_range(&display_map).sorted();
+                        let row = if above {
+                            range.start.row()
+                        } else {
+                            range.end.row()
+                        };
                         let positions =
                             if let SelectionGoal::HorizontalRange { start, end } = selection.goal {
                                 Pixels::from(start)..Pixels::from(end)
@@ -2203,9 +2221,6 @@ impl Editor {
             }
         }
 
-        if final_selections.is_empty() {
-            return;
-        }
         self.change_selections_with_history(
             SelectionEffects::default(),
             history_entry,
@@ -2216,7 +2231,7 @@ impl Editor {
 
         let final_selection_ids: HashSet<_> = self
             .selections
-            .all::<Point>(&display_map)
+            .disjoint_anchors()
             .iter()
             .map(|s| s.id)
             .collect();

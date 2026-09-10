@@ -5,7 +5,10 @@ use language::{Bias, LanguageAwareStyling, Point};
 use multi_buffer::{MBTextSummary, MultiBufferRow};
 use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 
-use crate::display_map::{DisplaySnapshot, FoldPoint, Highlights, TabPoint, ToDisplayPoint as _};
+use crate::{
+    DisplayPoint,
+    display_map::{DisplaySnapshot, FoldPoint, Highlights, TabPoint, ToDisplayPoint as _},
+};
 
 pub(crate) struct ColumnarSelectionRows<'a> {
     snapshot: &'a DisplaySnapshot,
@@ -79,17 +82,30 @@ impl<'a> ColumnarSelectionRows<'a> {
                 continue;
             }
             let point = tabs.tab_point_to_point(tab_point, Bias::Left);
+            let display_point = point.to_display_point(self.snapshot);
+            let hidden = self.snapshot.is_block_line(display_point.row());
             let canonical = tabs.point_to_tab_point(point, Bias::Left);
-            if self.buffer_row(point.row).is_boundary(point.column)
+            if !hidden
                 && canonical == tab_point
-                && point
-                    .to_display_point(self.snapshot)
-                    .to_point(self.snapshot)
-                    == point
+                && self.buffer_row(point.row).is_boundary(point.column)
             {
                 return Some(point);
             }
-            let preceding = if canonical < tab_point {
+            let preceding = if hidden && canonical == tab_point {
+                let hidden_start = self.snapshot.display_point_to_fold_point(
+                    DisplayPoint::new(display_point.row(), 0),
+                    Bias::Left,
+                );
+                let hidden_start = tabs.fold_point_to_tab_point(hidden_start);
+                if hidden_start.row() != row {
+                    return None;
+                }
+                if hidden_start < tab_point {
+                    hidden_start
+                } else {
+                    TabPoint::new(row, hidden_start.column().checked_sub(1)?)
+                }
+            } else if canonical < tab_point {
                 canonical
             } else {
                 let previous = if let Some(byte) = point.column.checked_sub(1) {
@@ -107,10 +123,14 @@ impl<'a> ColumnarSelectionRows<'a> {
                 };
                 tabs.point_to_tab_point(previous, Bias::Left)
             };
-            if preceding.row() != row || preceding >= tab_point {
+            if preceding.row() != row {
                 return None;
             }
-            let column = self.row(row).column_for_byte(preceding.column());
+            let column = if preceding < tab_point {
+                self.row(row).column_for_byte(preceding.column())
+            } else {
+                self.row(row).column_for_byte(byte).checked_sub(1)?
+            };
             byte = self.row(row).byte_for_column(column);
         }
     }
@@ -546,7 +566,7 @@ mod tests {
         assert_eq!(query.points_for_row(2, &(0..0)), None);
         assert_eq!(query.points_for_row(2, &(0..u32::MAX)), None);
         let rebuilt = state.build_map(cx).update(cx, |map, cx| map.snapshot(cx));
-        check_snapshot(&snapshot, &rebuilt, None, 4, &mut rng, 0);
+        check_snapshot(&snapshot, &rebuilt, true, None, 4, &mut rng, 0);
     }
 
     #[gpui::test]
@@ -666,6 +686,39 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn test_columnar_selection_fold_ending_inside_grapheme(cx: &mut TestAppContext) {
+        init_test(cx);
+        let map = plain_state("aX\u{1100}\u{1161}z", cx).build_map(cx);
+        map.update(cx, |map, cx| {
+            map.fold(
+                vec![Crease::simple(
+                    Point::new(0, 1)..Point::new(0, 5),
+                    FoldPlaceholder::test(),
+                )],
+                cx,
+            )
+        });
+        let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
+        assert_eq!(snapshot.tab_snapshot().text(), "a⋯\u{1161}z");
+        let mut query = ColumnarSelectionRows::new(&snapshot);
+        for (columns, expected) in [
+            (0..0, (Point::new(0, 0), Point::new(0, 0))),
+            (1..1, (Point::new(0, 1), Point::new(0, 1))),
+            (2..2, (Point::new(0, 1), Point::new(0, 1))),
+            (3..3, (Point::new(0, 8), Point::new(0, 8))),
+            (4..4, (Point::new(0, 9), Point::new(0, 9))),
+            (1..3, (Point::new(0, 1), Point::new(0, 8))),
+            (2..4, (Point::new(0, 1), Point::new(0, 9))),
+        ] {
+            assert_eq!(
+                query.points_for_row(0, &columns),
+                Some(expected),
+                "columns {columns:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_column_boundaries_large_grapheme() {
         let text = format!("e{}z", "\u{301}".repeat(1024));
@@ -675,6 +728,57 @@ mod tests {
         assert_eq!(query.byte_for_column(2), 2050);
         assert_eq!(query.column_for_byte(2048), 0);
         assert_eq!(query.column_for_byte(2049), 1);
+    }
+
+    #[gpui::test(iterations = 20)]
+    fn test_columnar_selection_during_pending_rewrap(cx: &mut TestAppContext, mut rng: StdRng) {
+        init_test(cx);
+        cx.background_executor.set_block_on_ticks(0..=0);
+        let text = (0..120)
+            .map(|row| format!("row{row} {}", random_text(&mut rng, 6)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut state = plain_state(&text, cx);
+        let map = state.build_map(cx);
+        let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
+        let buffer = snapshot.buffer_snapshot();
+        let hidden_start = rng.random_range(0..buffer.max_point().row);
+        let hidden_end = rng.random_range(hidden_start..=buffer.max_point().row);
+        state.block = Some((
+            BlockPlacement::Replace(
+                buffer.anchor_before(Point::new(hidden_start, 0))
+                    ..=buffer.anchor_after(Point::new(
+                        hidden_end,
+                        buffer.line_len(MultiBufferRow(hidden_end)),
+                    )),
+            ),
+            1,
+        ));
+        map.update(cx, |map, cx| {
+            map.insert_blocks([state.block_properties().expect("block")], cx)
+        });
+        state.wrap_width = Some(px(30.0));
+        map.update(cx, |map, cx| map.set_wrap_width(state.wrap_width, cx));
+        assert!(map.update(cx, |map, cx| map.is_rewrapping(cx)));
+        let interpolated = map.update(cx, |map, cx| map.snapshot(cx));
+        assert!(map.update(cx, |map, cx| map.is_rewrapping(cx)));
+        check_snapshot(&interpolated, &interpolated, true, None, 4, &mut rng, 0);
+        let rebuilt = state.build_map(cx);
+        cx.run_until_parked();
+        assert!(!map.update(cx, |map, cx| map.is_rewrapping(cx)));
+        let rebuilt = rebuilt.update(cx, |map, cx| map.snapshot(cx));
+        let settled = map.update(cx, |map, cx| map.snapshot(cx));
+        assert_eq!(hidden_rows(&settled), hidden_rows(&rebuilt));
+        check_snapshot(&settled, &rebuilt, true, None, 4, &mut rng, 1);
+        check_snapshot(
+            &interpolated,
+            &settled,
+            hidden_rows(&interpolated) == hidden_rows(&settled),
+            None,
+            4,
+            &mut rng,
+            2,
+        );
     }
 
     #[gpui::test(iterations = 100)]
@@ -717,6 +821,7 @@ mod tests {
         check_snapshot(
             &snapshot,
             &snapshot,
+            true,
             Some(&texts.join("\n")),
             4,
             &mut rng,
@@ -732,6 +837,7 @@ mod tests {
                 state.block,
                 state.wrap_width
             );
+            let replaced_before = state.replaces_rows();
             match kind {
                 0 => {
                     let index = rng.random_range(0..buffers.len());
@@ -764,6 +870,14 @@ mod tests {
                         buffer.edit([(range, replacement)], None, cx)
                     });
                     *text = expected;
+                    if state.replaces_rows() {
+                        map.update(cx, |map, cx| {
+                            map.remove_blocks(std::mem::take(&mut block_ids), cx);
+                            block_ids.extend(
+                                map.insert_blocks([state.block_properties().expect("block")], cx),
+                            );
+                        });
+                    }
                 }
                 1 => {
                     let size = rng.random_range(1..128);
@@ -791,6 +905,10 @@ mod tests {
                         map.update(cx, |map, cx| {
                             map.unfold_intersecting([Anchor::Min..Anchor::Max], true, cx)
                         });
+                        if state.replaces_rows() {
+                            block_ids.clear();
+                            state.block = None;
+                        }
                     }
                 }
                 3 | 6 => {
@@ -837,13 +955,22 @@ mod tests {
                     } else {
                         let text = snapshot.buffer_snapshot().text();
                         let boundaries = scalar_boundaries(&text);
-                        let offset =
-                            MultiBufferOffset(boundaries[rng.random_range(0..boundaries.len())]);
-                        state.block = Some((
-                            snapshot.buffer_snapshot().anchor_after(offset),
-                            rng.random(),
-                            rng.random_range(1..=3),
-                        ));
+                        let start = rng.random_range(0..boundaries.len());
+                        let buffer = snapshot.buffer_snapshot();
+                        let position = buffer.anchor_after(MultiBufferOffset(boundaries[start]));
+                        let placement = match rng.random_range(0..3) {
+                            0 => BlockPlacement::Above(position),
+                            1 => BlockPlacement::Below(position),
+                            _ => {
+                                let start = rng.random_range(0..boundaries.len() - 1);
+                                let end = rng.random_range(start + 1..boundaries.len());
+                                BlockPlacement::Replace(
+                                    buffer.anchor_before(MultiBufferOffset(boundaries[start]))
+                                        ..=buffer.anchor_after(MultiBufferOffset(boundaries[end])),
+                                )
+                            }
+                        };
+                        state.block = Some((placement, rng.random_range(1..=3)));
                         block_ids.extend(map.update(cx, |map, cx| {
                             map.insert_blocks([state.block_properties().expect("block")], cx)
                         }));
@@ -867,32 +994,43 @@ mod tests {
                 && state
                     .inlays
                     .iter()
-                    .all(|inlay| !inlay.position.is_valid(snapshot.buffer_snapshot())))
+                    .all(|inlay| !inlay.position.is_valid(snapshot.buffer_snapshot()))
+                && !state.replaces_rows())
             .then_some(text.as_str());
-            let rebuilt = state.build_map(cx).update(cx, |map, cx| map.snapshot(cx));
+            let rewrapping = map.update(cx, |map, cx| map.is_rewrapping(cx));
+            let rebuilt = state.build_map(cx);
+            cx.run_until_parked();
+            let rebuilt = rebuilt.update(cx, |map, cx| map.snapshot(cx));
+            let settled = map.update(cx, |map, cx| map.snapshot(cx));
+            assert_eq!(
+                hidden_rows(&settled),
+                hidden_rows(&rebuilt),
+                "operation {operation}: hidden rows"
+            );
             check_snapshot(
                 &snapshot,
                 &rebuilt,
+                !state.replaces_rows() || !rewrapping,
                 plain,
                 state.tab_size,
                 &mut rng,
                 operation,
             );
-            if kind == 4 || kind == 5 {
+            if (kind == 4 || kind == 5) && !replaced_before && !state.replaces_rows() {
                 check_snapshot(
                     &snapshot,
                     &previous,
+                    true,
                     plain,
                     state.tab_size,
                     &mut rng,
                     operation,
                 );
             }
-            cx.run_until_parked();
-            let settled = map.update(cx, |map, cx| map.snapshot(cx));
             check_snapshot(
                 &settled,
                 &rebuilt,
+                true,
                 plain,
                 state.tab_size,
                 &mut rng,
@@ -907,7 +1045,7 @@ mod tests {
         tab_size: u32,
         folds: Vec<Range<Anchor>>,
         inlays: Vec<Inlay>,
-        block: Option<(Anchor, bool, u32)>,
+        block: Option<(BlockPlacement<Anchor>, u32)>,
         wrap_width: Option<Pixels>,
     }
 
@@ -954,18 +1092,20 @@ mod tests {
             })
         }
 
+        fn replaces_rows(&self) -> bool {
+            matches!(self.block, Some((BlockPlacement::Replace(_), _)))
+        }
+
         fn block_properties(&self) -> Option<BlockProperties<Anchor>> {
-            self.block.map(|(position, above, height)| BlockProperties {
-                placement: if above {
-                    BlockPlacement::Above(position)
-                } else {
-                    BlockPlacement::Below(position)
-                },
-                style: BlockStyle::Fixed,
-                height: Some(height),
-                render: Arc::new(|_| div().into_any()),
-                priority: 0,
-            })
+            self.block
+                .as_ref()
+                .map(|(placement, height)| BlockProperties {
+                    placement: placement.clone(),
+                    style: BlockStyle::Fixed,
+                    height: Some(*height),
+                    render: Arc::new(|_| div().into_any()),
+                    priority: 0,
+                })
         }
     }
 
@@ -974,6 +1114,12 @@ mod tests {
         len: u32,
         columns: Vec<(u32, u32)>,
         points: Vec<(u32, u32)>,
+    }
+
+    fn hidden_rows(snapshot: &DisplaySnapshot) -> Vec<bool> {
+        (0..=snapshot.buffer_snapshot().max_point().row)
+            .map(|row| snapshot.is_block_line(Point::new(row, 0).to_display_point(snapshot).row()))
+            .collect()
     }
 
     fn init_test(cx: &mut TestAppContext) {
@@ -1163,6 +1309,7 @@ mod tests {
     fn check_snapshot(
         snapshot: &DisplaySnapshot,
         rebuilt: &DisplaySnapshot,
+        blocks_agree: bool,
         plain: Option<&str>,
         tab_size: u32,
         rng: &mut StdRng,
@@ -1286,9 +1433,11 @@ mod tests {
                     let tab = snapshot
                         .tab_snapshot()
                         .point_to_tab_point(point, Bias::Left);
+                    let display = point.to_display_point(snapshot);
                     if tab.row() as usize != row
                         || snapshot.tab_snapshot().tab_point_to_point(tab, Bias::Left) != point
-                        || point.to_display_point(snapshot).to_point(snapshot) != point
+                        || display.to_point(snapshot) != point
+                        || snapshot.is_block_line(display.row())
                     {
                         return None;
                     }
@@ -1310,11 +1459,13 @@ mod tests {
                 u32::MAX..u32::MAX,
             ] {
                 let points = query.points_for_row(row as u32, &columns);
-                assert_eq!(
-                    points,
-                    rebuilt_query.points_for_row(row as u32, &columns),
-                    "operation {operation}: row {row}, columns {columns:?}"
-                );
+                if blocks_agree {
+                    assert_eq!(
+                        points,
+                        rebuilt_query.points_for_row(row as u32, &columns),
+                        "operation {operation}: row {row}, columns {columns:?}"
+                    );
+                }
                 if let Some(expected) = &expected {
                     assert_eq!(
                         points,

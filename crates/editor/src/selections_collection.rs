@@ -116,6 +116,13 @@ impl SelectionsCollection {
         resolve_selections_wrapping_blocks(self.pending_anchor(), &snapshot).next()
     }
 
+    pub(crate) fn all_unexpanded<D>(&self, snapshot: &DisplaySnapshot) -> Vec<Selection<D>>
+    where
+        D: MultiBufferDimension + Sub + AddAssign<<D as Sub>::Output> + Ord,
+    {
+        self.all_iter(snapshot, false).collect()
+    }
+
     pub(crate) fn pending_mode(&self) -> Option<SelectMode> {
         self.pending.as_ref().map(|pending| pending.mode.clone())
     }
@@ -124,19 +131,21 @@ impl SelectionsCollection {
     where
         D: MultiBufferDimension + Sub + AddAssign<<D as Sub>::Output> + Ord,
     {
-        self.all_iter(snapshot).collect()
+        self.all_iter(snapshot, true).collect()
     }
 
     fn all_iter<'a, D>(
         &'a self,
         snapshot: &'a DisplaySnapshot,
+        expand_blocks: bool,
     ) -> impl 'a + Iterator<Item = Selection<D>>
     where
         D: 'a + MultiBufferDimension + Sub + AddAssign<<D as Sub>::Output> + Ord,
     {
         let mut disjoint =
-            resolve_selections_wrapping_blocks::<D, _>(self.disjoint.iter(), snapshot).peekable();
-        let mut pending_opt = self.pending::<D>(snapshot);
+            resolve_selections::<D, _>(self.disjoint.iter(), snapshot, expand_blocks).peekable();
+        let mut pending_opt =
+            resolve_selections::<D, _>(self.pending_anchor(), snapshot, expand_blocks).next();
         iter::from_fn(move || {
             if let Some(pending) = pending_opt.as_mut() {
                 while let Some(next_selection) = disjoint.peek() {
@@ -348,7 +357,7 @@ impl SelectionsCollection {
                 .next()
                 .unwrap();
         }
-        self.all_iter(snapshot).next().unwrap()
+        self.all_iter(snapshot, true).next().unwrap()
     }
 
     pub fn last<D>(&self, snapshot: &DisplaySnapshot) -> Selection<D>
@@ -362,7 +371,7 @@ impl SelectionsCollection {
                 .next()
                 .unwrap();
         }
-        self.all_iter(snapshot).last().unwrap()
+        self.all_iter(snapshot, true).last().unwrap()
     }
 
     /// Returns a list of (potentially backwards!) ranges representing the selections.
@@ -414,6 +423,9 @@ impl SelectionsCollection {
         reversed: bool,
         text_layout_details: &TextLayoutDetails,
     ) -> Option<Selection<Point>> {
+        if display_map.is_block_line(row) {
+            return None;
+        }
         let is_empty = positions.start == positions.end;
         let line_len = display_map.line_len(row);
         let line = display_map.layout_row(row, text_layout_details);
@@ -524,11 +536,7 @@ impl SelectionsCollection {
                 goal_columns,
                 selection.reversed,
             ) {
-                if (above && candidate.start < selection.start)
-                    || (!above && candidate.end > selection.end)
-                {
-                    return Some(candidate);
-                }
+                return Some(candidate);
             }
         }
     }
@@ -1189,9 +1197,21 @@ where
     D: MultiBufferDimension + Sub + AddAssign<<D as Sub>::Output> + Ord,
     I: 'a + IntoIterator<Item = &'a Selection<Anchor>>,
 {
+    resolve_selections(selections, map, true)
+}
+
+fn resolve_selections<'a, D, I>(
+    selections: I,
+    map: &'a DisplaySnapshot,
+    expand_blocks: bool,
+) -> impl 'a + Iterator<Item = Selection<D>>
+where
+    D: MultiBufferDimension + Sub + AddAssign<<D as Sub>::Output> + Ord,
+    I: 'a + IntoIterator<Item = &'a Selection<Anchor>>,
+{
     // Without collapsed content, coalescing in buffer point space is equivalent to coalescing in
     // display point space, so skip the per-selection display-coordinate round trip.
-    if !map.has_collapsed_content() {
+    if !expand_blocks || !map.has_collapsed_content() {
         Either::Left(resolve_selections_without_display_round_trip(
             selections, map,
         ))
